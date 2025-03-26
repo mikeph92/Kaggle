@@ -7,17 +7,17 @@ from sklearn.ensemble import RandomForestClassifier
 from sklearn.metrics import roc_auc_score
 from bayes_opt import BayesianOptimization
 from scipy.stats import rankdata
-from imblearn.over_sampling import SMOTE
 import warnings
 warnings.filterwarnings("ignore")
 
 # Data loading
-train = pd.read_csv("data/train.csv")
-test = pd.read_csv("data/test.csv")
+train = pd.read_csv("data/rainfall_transformed.csv")  # Training data
+val = pd.read_csv("data/train.csv")                  # Validation data
+test = pd.read_csv("data/test.csv")                  # Test data
 
 # ======= 1. Improved Feature Engineering =======
 # Create new variables
-for df in [train, test]:
+for df in [train, val, test]:
     # Change rates of original variables
     df['temp_change_rate'] = df['temparature'].diff().fillna(0)
     df['humidity_change_trend'] = df['humidity'].diff().fillna(0)
@@ -47,40 +47,15 @@ for df in [train, test]:
 
 # Fill NA values with 0
 train = train.fillna(0)
+val = val.fillna(0)
 test = test.fillna(0)
 
 RMV = ['rainfall', 'id']
 FEATURES = [c for c in train.columns if c not in RMV]
 
-# ======= 2. Handle Class Imbalance =======
-# Check target variable distribution
-rainfall_counts = train['rainfall'].value_counts()
-print("Target variable distribution:", rainfall_counts)
-
-# If imbalanced, use SMOTE
-if min(rainfall_counts) / max(rainfall_counts) < 0.5:
-    print("Imbalance detected, applying SMOTE oversampling...")
-    X = train[FEATURES]
-    y = train['rainfall']
-    smote = SMOTE(random_state=42)
-    
-    # Choose one of these options:
-    # Option 1: Enable SMOTE
-    X_resampled, y_resampled = smote.fit_resample(X, y)
-    
-    # Option 2: Don't use SMOTE but keep original data
-    # X_resampled, y_resampled = X, y
-    
-    # Convert back to DataFrame
-    train_resampled = pd.DataFrame(X_resampled, columns=FEATURES)
-    train_resampled['rainfall'] = y_resampled
-    
-    # Replace original training set (can be enabled if needed)
-    train = train_resampled
-
-# ======= 3. Bayesian Optimization for XGBoost =======
+# ======= 2. Bayesian Optimization for XGBoost =======
 def xgb_cv(max_depth, learning_rate, subsample, colsample_bytree, gamma, reg_alpha, reg_lambda, min_child_weight):
-    """Bayesian optimization objective function - added min_child_weight parameter"""
+    """Bayesian optimization objective function"""
     params = {
         'max_depth': int(max_depth),
         'learning_rate': learning_rate,
@@ -92,7 +67,7 @@ def xgb_cv(max_depth, learning_rate, subsample, colsample_bytree, gamma, reg_alp
         'min_child_weight': min_child_weight,
         'n_estimators': 10000,
         'eval_metric': 'auc',
-        'early_stopping_rounds': 100  # Increased from 80
+        'early_stopping_rounds': 100
     }
     
     cv_scores = []
@@ -121,21 +96,19 @@ def xgb_cv(max_depth, learning_rate, subsample, colsample_bytree, gamma, reg_alp
         cv_scores.append(val_auc)
         train_auc_scores.append(train_auc)
     
-    # Calculate overfitting metric
     mean_train_auc = np.mean(train_auc_scores)
     mean_val_auc = np.mean(cv_scores)
     overfit_gap = mean_train_auc - mean_val_auc
     print(f"Train AUC = {mean_train_auc:.3f}, Val AUC = {mean_val_auc:.3f}, Overfitting = {overfit_gap:.3f}")
     
-    # Penalize for severe overfitting
     if overfit_gap > 0.05:
-        return mean_val_auc * 0.95  # Penalize overfitting parameter combinations
+        return mean_val_auc * 0.95  # Penalize overfitting
     elif overfit_gap > 0.1:
         return mean_val_auc * 0.9
     
     return mean_val_auc
 
-# ======= 4. Bayesian Optimization for Random Forest =======
+# ======= 3. Bayesian Optimization for Random Forest =======
 def rf_cv(n_estimators, max_depth, min_samples_split, min_samples_leaf):
     """Bayesian optimization objective function for Random Forest"""
     params = {
@@ -169,7 +142,6 @@ def rf_cv(n_estimators, max_depth, min_samples_split, min_samples_leaf):
         cv_scores.append(val_auc)
         train_auc_scores.append(train_auc)
     
-    # Calculate overfitting metric
     mean_train_auc = np.mean(train_auc_scores)
     mean_val_auc = np.mean(cv_scores)
     overfit_gap = mean_train_auc - mean_val_auc
@@ -177,8 +149,7 @@ def rf_cv(n_estimators, max_depth, min_samples_split, min_samples_leaf):
     
     return mean_val_auc
 
-# ======= 5. Run Bayesian Optimization for XGBoost =======
-# Expanded parameter space
+# ======= 4. Run Bayesian Optimization for XGBoost =======
 xgb_pbounds = {
     'max_depth': (3, 12),
     'learning_rate': (0.01, 0.3),
@@ -205,7 +176,7 @@ xgb_best_params = xgb_optimizer.max['params']
 xgb_best_params['max_depth'] = int(xgb_best_params['max_depth'])
 print('Best XGBoost parameters:', xgb_best_params)
 
-# ======= 6. Run Bayesian Optimization for Random Forest =======
+# ======= 5. Run Bayesian Optimization for Random Forest =======
 rf_pbounds = {
     'n_estimators': (50, 300),
     'max_depth': (3, 15),
@@ -229,14 +200,14 @@ rf_best_params['n_estimators'] = int(rf_best_params['n_estimators'])
 rf_best_params['max_depth'] = int(rf_best_params['max_depth'])
 print('Best Random Forest parameters:', rf_best_params)
 
-# ======= 7. Cross-validation with optimized models =======
+# ======= 6. Cross-validation with optimized models =======
 FOLDS = 5
 kf = KFold(n_splits=FOLDS, shuffle=True, random_state=42)
 
 # Prepare arrays for predictions
-oof_xgb = np.zeros(len(train))
+oof_xgb = np.zeros(len(val))  # Validation set predictions
 pred_xgb = np.zeros(len(test))
-oof_rf = np.zeros(len(train))
+oof_rf = np.zeros(len(val))
 pred_rf = np.zeros(len(test))
 
 xgb_fold_train_auc = []
@@ -244,15 +215,15 @@ xgb_fold_val_auc = []
 rf_fold_train_auc = []
 rf_fold_val_auc = []
 
-for i, (train_index, test_index) in enumerate(kf.split(train)):
+for i, (train_index, val_index) in enumerate(kf.split(train)):
     print("#"*25)
     print(f"### Fold {i+1}")
     print("#"*25)
     
     x_train = train.loc[train_index, FEATURES]
     y_train = train.loc[train_index, "rainfall"]
-    x_valid = train.loc[test_index, FEATURES]
-    y_valid = train.loc[test_index, "rainfall"]
+    x_valid = val.loc[val_index % len(val), FEATURES]  # Adjust indices for validation set
+    y_valid = val.loc[val_index % len(val), "rainfall"]
     x_test = test[FEATURES]
 
     # XGBoost model
@@ -310,9 +281,9 @@ for i, (train_index, test_index) in enumerate(kf.split(train)):
     rf_fold_train_auc.append(rf_train_auc)
     rf_fold_val_auc.append(rf_val_auc)
     
-    # Store out-of-fold predictions
-    oof_xgb[test_index] = xgb_val_pred
-    oof_rf[test_index] = rf_val_pred
+    # Store out-of-fold predictions (for validation set)
+    oof_xgb[val_index % len(val)] = xgb_val_pred
+    oof_rf[val_index % len(val)] = rf_val_pred
     
     # Accumulate test predictions
     pred_xgb += xgb_test_pred / FOLDS
@@ -321,8 +292,7 @@ for i, (train_index, test_index) in enumerate(kf.split(train)):
     print(f"XGBoost - Train AUC: {xgb_train_auc:.4f}, Val AUC: {xgb_val_auc:.4f}")
     print(f"Random Forest - Train AUC: {rf_train_auc:.4f}, Val AUC: {rf_val_auc:.4f}")
 
-# ======= 8. Optimize ensemble weights =======
-# Function to find optimal weights for ensemble
+# ======= 7. Optimize ensemble weights =======
 def optimize_weights(oof_preds, y_true):
     """Find optimal weights for model blending using simple grid search"""
     best_score = 0
@@ -332,7 +302,6 @@ def optimize_weights(oof_preds, y_true):
         w1 = w1 / 10
         w2 = 1 - w1
         
-        # Blend predictions
         blend_preds = w1 * oof_preds[0] + w2 * oof_preds[1]
         score = roc_auc_score(y_true, blend_preds)
         
@@ -342,12 +311,11 @@ def optimize_weights(oof_preds, y_true):
     
     return best_weights, best_score
 
-# Optimize weights for XGBoost and RF ensemble
-weights, score = optimize_weights([oof_xgb, oof_rf], train['rainfall'])
+# Optimize weights for XGBoost and RF ensemble using validation set
+weights, score = optimize_weights([oof_xgb, oof_rf], val['rainfall'])
 print(f"Optimized ensemble weights: XGBoost={weights[0]:.2f}, RF={weights[1]:.2f}, Score={score:.4f}")
 
-# ======= 9. Dynamic threshold optimization =======
-# Find optimal thresholds for classification
+# ======= 8. Dynamic threshold optimization =======
 def find_optimal_thresholds(oof_preds, y_true):
     """Find upper and lower thresholds for classification adjustment"""
     best_score = roc_auc_score(y_true, oof_preds)
@@ -358,14 +326,10 @@ def find_optimal_thresholds(oof_preds, y_true):
         for upper in range(85, 100, 1):  # 0.85 to 0.99
             upper = upper / 100
             
-            # Copy predictions
             adjusted_preds = oof_preds.copy()
-            
-            # Apply thresholds
             adjusted_preds[adjusted_preds < lower] = 0
             adjusted_preds[adjusted_preds > upper] = 1
             
-            # Calculate score
             score = roc_auc_score(y_true, adjusted_preds)
             
             if score > best_score:
@@ -374,14 +338,14 @@ def find_optimal_thresholds(oof_preds, y_true):
     
     return best_thresholds, best_score
 
-# Calculate ensemble OOF predictions
+# Calculate ensemble OOF predictions for validation set
 oof_ensemble = weights[0] * oof_xgb + weights[1] * oof_rf
 
 # Find optimal thresholds
-thresholds, threshold_score = find_optimal_thresholds(oof_ensemble, train['rainfall'])
+thresholds, threshold_score = find_optimal_thresholds(oof_ensemble, val['rainfall'])
 print(f"Optimal thresholds: Lower={thresholds[0]:.2f}, Upper={thresholds[1]:.2f}, Score={threshold_score:.4f}")
 
-# ======= 10. Create final predictions and submission file =======
+# ======= 9. Create final predictions and submission file =======
 # Combine XGBoost and Random Forest predictions with optimal weights
 final_pred = weights[0] * pred_xgb + weights[1] * pred_rf
 
@@ -407,11 +371,10 @@ final_pred_adjusted[final_pred > thresholds[1]] = 1
 # Create submission file
 sample = pd.read_csv("outputs/sample_submission.csv")
 sample.rainfall = final_pred_adjusted
-sample.to_csv("outputs/submission_23.03.csv", index=False)
+sample.to_csv("outputs/submission_26.03.csv", index=False)
 print("Final submission file created")
 
-# ======= 11. Model performance analysis =======
-# Overfitting analysis for both models
+# ======= 10. Model performance analysis =======
 print("\n===== Model Performance Analysis =====")
 xgb_mean_train_auc = np.mean(xgb_fold_train_auc)
 xgb_mean_val_auc = np.mean(xgb_fold_val_auc)
